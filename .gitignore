@@ -1,0 +1,86 @@
+# ============================================================
+# Surpass 目标用户精准营销建模 —— Python 工程 .gitignore
+# 原则：源码/配置/测试/脚本入库；缓存、日志、模型与大体积派生数据不入库
+#       （outputs/ 下所有产物均可通过 `python -m surpass_marketing.main --run all` 重建）
+# ============================================================
+
+# ---------------- Python 编译产物 ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---------------- 虚拟环境 / conda ----------------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+*.conda
+
+# ---------------- 测试与覆盖率 ----------------
+.pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# ---------------- 生成产物（可一键重建，不入库）----------------
+outputs/*
+!outputs/.gitkeep
+
+# ---------------- 数据与模型缓存 ----------------
+*.parquet
+*.joblib
+*.pkl
+*.pickle
+*.h5
+*.npy
+*.npz
+*.log
+logs/
+interim/
+models/
+
+# ---------------- 编辑器 / IDE ----------------
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# ---------------- 操作系统 ----------------
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+
+# ---------------- Office 临时锁文件 ----------------
+~$*.docx
+~$*.doc
+~$*.xlsx
+~$*.pptx
+*.tmp
+
+# ---------------- 本地环境变量 / 密钥 ----------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------- 个人临时分析脚本 ----------------
+_tmp_*
+scratch/
+playground/

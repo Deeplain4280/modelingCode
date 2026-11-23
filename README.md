@@ -1,0 +1,147 @@
+# Surpass 目标用户购买意愿建模与精准营销系统
+
+2025 年数学建模 B 题「品牌手机目标用户的精准营销」的完整工程实现。系统以附件 1 的 7 张用户行为表为
+数据源，完成数据审计、描述统计、基本行为特征影响分析、个人偏好影响分析，并对附件 2 的 50 名待判用户
+给出购买概率、潜力分层与营销建议，同时输出附件 1 未购用户的 Top100 优先名单。
+
+## 1. 快速开始
+
+### 1.1 环境（Anaconda）
+
+工程以 Anaconda 管理环境，推荐新建独立环境（Python 3.11）：
+
+```bash
+conda env create -f environment.yml
+conda activate surpass-modeling
+```
+
+也可以直接复用已有的 Anaconda base 环境（Python 3.13 已实测通过）：
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+若未执行 `pip install -e .`，请在 `code/` 目录下临时把 `src` 加入模块搜索路径：
+
+```bash
+# Windows PowerShell
+$env:PYTHONPATH="src"
+# Git Bash / CMD 风格
+export PYTHONPATH=src
+```
+
+### 1.2 运行
+
+```bash
+# 交互式 TUI（Rich 编号菜单）
+python -m surpass_marketing.main
+
+# 批处理：一次跑通数据审计 + 问题1~4
+python -m surpass_marketing.main --run all
+
+# 单独运行某一问题
+python -m surpass_marketing.main --run q2
+python -m surpass_marketing.main --run q4
+
+# 强制重建特征表（原始 xlsx 只读，特征缓存在 outputs/interim）
+python -m surpass_marketing.main --run all --force-features
+```
+
+TUI 菜单：
+
+| 编号 | 功能 |
+| --- | --- |
+| 0 | 数据审计（8 张表行数、去重、覆盖率、时间范围、质量问题清单） |
+| 1 | 问题 1：数据预处理与描述统计 |
+| 2 | 问题 2：基本行为特征对购买的影响 |
+| 3 | 问题 3：个人偏好对购买的影响 |
+| 4 | 问题 4：潜力用户识别、附件 2 判定与营销分层 |
+| 5 | 一键完整运行（审计 + 四问） |
+| 6 | 查看输出文件与最近日志 |
+| q | 退出 |
+
+## 2. 工程结构
+
+```text
+code/
+├─ configs/default.yaml          # 全局参数（种子、阈值、模型超参、成本收益）
+├─ environment.yml               # conda 环境
+├─ requirements.txt / pyproject.toml
+├─ src/surpass_marketing/
+│  ├─ main.py                    # 命令行入口（--run；无参数进 TUI）
+│  ├─ config.py                  # 配置加载与路径解析
+│  ├─ controller/                # 控制层：只做用例编排与转发
+│  ├─ service/                   # 服务抽象（ABC）
+│  ├─ service_impl/              # 服务实现：数据/分析/建模/预测
+│  ├─ domain/                    # 实体、枚举、业务常量
+│  ├─ repository/                # Excel 读取（parquet 缓存）与产物落盘
+│  ├─ ui/                        # TUI 视图（Rich）
+│  └─ utils/                     # 日志、文本解析、绘图工具
+├─ tests/                        # pytest 单元测试
+└─ outputs/
+   ├─ interim/                   # sheet 级 parquet 缓存 + 用户特征表
+   ├─ tables/                    # 全部结果表（CSV，UTF-8 with BOM）
+   ├─ figures/                   # 全部图（PNG，300 dpi）
+   ├─ models/                    # 校准模型与元数据
+   └─ logs/                      # 运行日志
+```
+
+分层调用关系：`main / TUI → controller → service(ABC) → service_impl → repository`，
+领域对象（`domain/entities.py`）在层间传递，UI 与控制器不含任何建模逻辑。
+
+## 3. 方法概要
+
+- **数据审计**：8 张表行数、唯一用户、重复行、对目标用户覆盖率、时间范围、6 类数据质量问题。
+- **问题 1**：按用户聚合（多状态取"购买"优先），输出跟踪状态分布、人口属性分布、覆盖率、
+  7 项行为指数描述统计与活跃时段分布。
+- **问题 2**：以"是否购买"为标签（575/16295 = 3.53%），构建 53 个基本行为特征
+  （人口学、职业、行为指数、时间行为、活跃度、覆盖率标记）。正则化 Logistic 为主模型，
+  随机森林与 HistGradientBoosting 作稳健性对照；5 折 CV + 固定分层留出测试集，
+  报告 PR-AUC、ROC-AUC、F1、召回、精确率、Brier；并给出单变量检验与分组购买率提升。
+- **问题 3**：由电商品牌/品类、视频题材、触媒渠道、购物倾向标签构造 8 个可解释偏好指标
+  （手机数码偏好、高端品牌偏好、性价比偏好、娱乐内容偏好、资讯严肃偏好、社交偏好、
+  促销敏感、生活品质偏好），标准化后做 PCA 降维；在控制问题 2 基本变量后，
+  用 M1/M2/M3 三套方案比较偏好增量解释力，再以 KMeans（轮廓系数选 k）做用户画像。
+- **问题 4**：综合问题 2、3 特征训练校准模型（CalibratedClassifierCV，sigmoid，5 折），
+  以 5 折 CV PR-AUC 选型（Logistic 差距 ≤0.02 时优先可解释模型）；潜力评分 `S = 100 × P`；
+  阈值由训练集 OOF 最大 F1 与训练集全体用户分数 0.90/0.70 分位预先确定；输出附件 2 的 50 人
+  概率/等级/主要驱动/建议动作、附件 1 未购用户 Top100（分数降序、同分用户编号升序），
+  并生成"潜力等级 × 画像"的分层营销矩阵（渠道、频次、创意、KPI）。附件 2 无真实标签，
+  文中所有精度指标均来自附件 1 的留出测试集，不对 50 人声称真实准确率。
+
+## 4. 输出清单
+
+| 目录 | 内容 |
+| --- | --- |
+| `outputs/tables` | `表1-1`~`表4-6`、`表4-1B` 全部结果 CSV |
+| `outputs/figures` | `图1-1`~`图4-4` 全部图（300 dpi） |
+| `outputs/models` | `q4_calibrated_model.joblib` + `.json` 元数据 |
+| `outputs/logs` | 每次运行日志、数据质量报告 |
+| `outputs/interim` | sheet 缓存与 196 列用户特征表 |
+| `outputs/tables/运行摘要.txt` | 一键运行时各问题产物与核心指标的汇总 |
+
+`outputs/logs/data_quality_report.csv` 与 `data_quality_issues.txt` 为规划文件要求的数据质量留痕。
+在 base Python 3.13 + 单线程设置下，首次一键运行（含读取 117MB 原始 Excel 生成 parquet 缓存）
+约 7~9 分钟；已有缓存时约 4~5 分钟（主要耗时在问题 4 的三模型 5 折交叉验证与校准）。
+
+论文交付物位于工作区同级的 `论文/` 目录：`论文.docx`、`论文.md`、`图表/`（15 张）、
+`表格/`（全部结果 CSV）、`分析/题目分析报告.md`、`分析/术语表格.md`，与本代码工程的输出一一对应。
+
+## 5. 测试
+
+```bash
+pytest
+```
+
+覆盖：配置与路径、文本标签解析、特征分组（防标签/编号/附件2 标记泄漏）、概率区间与阈值、
+Top100 仅未购且无重复、附件 2 恰 50 人、稳定排序、产物读写、控制器转发、小样本端到端训练。
+
+## 6. 数据与假设边界
+
+- 原始 `B题/B题附件/*.xlsx` **只读**，任何派生结果只写入 `outputs/`。
+- "在某购物平台上的平均每次停留的时间 分:秒"列实际存储的是时间戳，按时间戳使用并记为数据质量问题。
+- 身份/行为标签/视频/触媒表仅覆盖部分用户；缺失不是"无行为"，以 `has_*` 标记显式建模。
+- 附件 2 的 30 人在附件 1 中出现，训练时按 `is_attachment2` 剔除，避免待判样本泄漏。
+- Surpass 相关文本（型号、品牌提及）是"关注过该机型"的观测，不能等同真实购买，论文中作为假设说明。
+- 观察窗口：附件 1 为 2015-11 当月；电商/视频行为跨至 12-07，视频自 11-13 起，存在窗口不一致。
