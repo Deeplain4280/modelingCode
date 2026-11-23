@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from surpass_marketing.service_impl.feature_columns import META_COLUMNS, select_features
 from surpass_marketing.service_impl.modeling_service_impl import ModelingServiceImpl
@@ -38,6 +39,15 @@ def test_build_matrix_missing_column_raises(config, artifacts, logger):
         raise AssertionError("缺失列应当抛出 KeyError")
 
 
+def test_build_matrix_rejects_leaky_columns(config, artifacts, logger):
+    service = ModelingServiceImpl(config, artifacts, logger)
+    frame = pd.DataFrame({"target": [0, 1], "age": [1, 2], "track_row_count": [1, 7]})
+    for leaky in ("track_row_count", "track_hour", "purchase_time"):
+        frame[leaky] = [1, 7]
+        with pytest.raises(ValueError):
+            service.build_matrix(frame, ["age", leaky])
+
+
 def test_train_q4_tiny_dataset_produces_calibrated_bundle(config, artifacts, logger):
     rng = np.random.RandomState(config.runtime.seed)
     n = 400
@@ -51,7 +61,7 @@ def test_train_q4_tiny_dataset_produces_calibrated_bundle(config, artifacts, log
             "occ_0": rng.randint(0, 2, n),
             "idx_shopping": rng.normal(30, 10, n),
             "track_hour": rng.randint(0, 24, n),
-            "vol_ecom_n": rng.poisson(5, n),
+            "vol_ecom_rate": rng.uniform(0.5, 5, n),
             "has_identity": np.ones(n),
             "brand_apple_share": rng.dirichlet([1, 1, 1], n)[:, 0],
             "pref_phone_share": rng.uniform(0, 1, n),

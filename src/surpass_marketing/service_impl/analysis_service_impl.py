@@ -283,12 +283,19 @@ class AnalysisServiceImpl(AnalysisService):
         index_frame = pd.DataFrame(index_rows)
         tables.append(self._table(index_frame, "表1-5_行为指数描述统计.csv"))
 
-        # ---------- 表1-6 时间行为分布 ----------
+        # ---------- 表1-6 时间行为分布（仅描述，跟踪时间不作为模型特征） ----------
         time_rows: List[Dict[str, Any]] = []
-        if "track_hour" in users.columns:
+        track_ts = (
+            pd.to_datetime(users["track_time"], errors="coerce")
+            if "track_time" in users.columns
+            else pd.Series(pd.NaT, index=users.index)
+        )
+        track_hour = track_ts.dt.hour
+        track_weekday = track_ts.dt.weekday
+        if track_hour.notna().any():
             bins = [-0.5, 5.5, 8.5, 11.5, 13.5, 17.5, 22.5, 23.5]
             labels = ["0-5时", "6-8时", "9-11时", "12-13时", "14-17时", "18-22时", "23时"]
-            hour_group = pd.cut(users["track_hour"], bins=bins, labels=labels)
+            hour_group = pd.cut(track_hour, bins=bins, labels=labels)
             for label, subset in users.groupby(hour_group, observed=True):
                 time_rows.append(
                     {
@@ -298,9 +305,9 @@ class AnalysisServiceImpl(AnalysisService):
                         "购买率": float(subset["target"].mean()),
                     }
                 )
-        if "track_weekday" in users.columns:
+        if track_weekday.notna().any():
             weekday_labels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-            weekday_group = users["track_weekday"].map(
+            weekday_group = track_weekday.map(
                 lambda value: weekday_labels[int(value)] if pd.notna(value) and 0 <= int(value) <= 6 else "未知"
             )
             for label, subset in users.groupby(weekday_group):
@@ -380,8 +387,8 @@ class AnalysisServiceImpl(AnalysisService):
         # ---------- 图1-5 活跃时段 ----------
         fig, axes = plt.subplots(1, 2, figsize=(10.5, 3.8))
         hours = np.arange(24)
-        counts_all = users["track_hour"].value_counts().reindex(hours, fill_value=0)
-        rate_by_hour = users.groupby(users["track_hour"].round())["target"].mean().reindex(hours)
+        counts_all = track_hour.value_counts().reindex(hours, fill_value=0)
+        rate_by_hour = users.groupby(track_hour.round())["target"].mean().reindex(hours)
         axes[0].bar(hours, counts_all.values, color=PALETTE[0])
         axes[0].set_title("最后跟踪时段人数分布")
         axes[0].set_xlabel("小时")
@@ -570,7 +577,19 @@ class AnalysisServiceImpl(AnalysisService):
         suite: ModelSuite = self.modeling.run_model_suite(users, features, "Q2")
 
         tables: List[str] = [self._table(suite.comparison, "表2-1_Q2模型对比.csv")]
-        coefficient_frame = self._coefficient_frame(suite.coefficients)
+        coefficients = suite.coefficients
+        coefficient_note = "入选模型"
+        if coefficients is None or coefficients.empty:
+            # 树模型入选时仍需要可解释的系数：另拟合一个全样本正则化 Logistic 作为参照模型，
+            # 仅用于方向与量级解释，不参与选型与性能汇报。
+            reference = self._logistic_pipeline()
+            matrix = users[features].astype(float)
+            reference.fit(matrix, users["target"].astype(int))
+            coefficients = pd.Series(
+                reference.named_steps["clf"].coef_.ravel(), index=features, name="标准化系数"
+            )
+            coefficient_note = "全样本正则化 Logistic 参照模型（仅用于解释，不参与选型）"
+        coefficient_frame = self._coefficient_frame(coefficients)
         tables.append(self._table(coefficient_frame, "表2-2_Q2_Logistic系数.csv"))
         tests = self._univariate_tests(users, features)
         tables.append(self._table(tests, "表2-3_Q2单变量统计检验.csv"))
@@ -580,12 +599,15 @@ class AnalysisServiceImpl(AnalysisService):
             "has_identity",
             "has_tags",
             "has_ecom",
-            "has_video",
             "has_media",
-            "track_is_weekend",
-            "track_is_night",
         ]
-        continuous_columns = ["idx_active", "idx_shopping", "vol_ecom_n", "vol_media_n", "vol_video_n", "idx_count"]
+        continuous_columns = [
+            "idx_active",
+            "idx_shopping",
+            "vol_ecom_rate",
+            "vol_media_n",
+            "idx_count",
+        ]
         lift = self._group_lift(users, binary_columns, continuous_columns)
         tables.append(self._table(lift, "表2-4_Q2分组购买率.csv"))
 
@@ -616,6 +638,7 @@ class AnalysisServiceImpl(AnalysisService):
         notes = (
             f"以 5 折交叉验证 PR-AUC 选型，入选 {suite.bundle.model_name}；"
             f"PR-AUC={suite.bundle.metrics.pr_auc:.4f}，ROC-AUC={suite.bundle.metrics.roc_auc:.4f}。"
+            f"系数表来源：{coefficient_note}。"
         )
         self.logger.info("问题2完成：%d 张表、%d 张图", len(tables), len(figures))
         return QuestionResult(
@@ -950,11 +973,10 @@ class AnalysisServiceImpl(AnalysisService):
             {"项目": "测试集ROC_AUC（校准后）", "数值": getattr(calibrated, "roc_auc", np.nan)},
             {"项目": "测试集PR_AUC（校准后）", "数值": getattr(calibrated, "pr_auc", np.nan)},
             {"项目": "测试集Brier（校准后）", "数值": getattr(calibrated, "brier", np.nan)},
-            {"项目": "测试集F1（校准后，按校准后F1阈值）", "数值": getattr(calibrated, "f1", np.nan)},
-            {"项目": "OOF最大F1阈值（未校准）", "数值": float(suite.extra.get("threshold", np.nan))},
-            {"项目": "校准后F1最优阈值", "数值": float(suite.extra.get("calibrated_threshold", np.nan))},
-            {"项目": "高潜力阈值（0.90分位）", "数值": float(thresholds.get("high", np.nan))},
-            {"项目": "中潜力阈值（0.70分位）", "数值": float(thresholds.get("medium", np.nan))},
+            {"项目": "测试集F1（校准后，按训练集OOF阈值）", "数值": getattr(calibrated, "f1", np.nan)},
+            {"项目": "训练集校准后OOF最大F1阈值", "数值": float(suite.extra.get("threshold", np.nan))},
+            {"项目": "高潜力阈值（训练集OOF 0.90分位）", "数值": float(thresholds.get("high", np.nan))},
+            {"项目": "中潜力阈值（训练集OOF 0.70分位）", "数值": float(thresholds.get("medium", np.nan))},
             {"项目": "成本收益平衡概率", "数值": float(thresholds.get("break_even", np.nan))},
         ]
         tables.append(self._table(pd.DataFrame(rows), "表4-2_校准与阈值.csv"))

@@ -12,8 +12,9 @@ from pathlib import Path
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Inches, Pt
+from docx.shared import Cm, Inches, Pt, RGBColor
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 PAPER_DIR = WORKSPACE / "论文"
@@ -75,13 +76,44 @@ def setup_document() -> Document:
     style.element.rPr.rFonts.set(qn("w:eastAsia"), BODY_FONT)
     style.paragraph_format.line_spacing = 1.5
     style.paragraph_format.space_after = Pt(3)
+    # 使用 Word 内置 Heading 1/2/3 样式，保留大纲级别以便自动生成目录
+    heading_sizes = {"Heading 1": 18, "Heading 2": 14, "Heading 3": 12}
+    for name, size in heading_sizes.items():
+        heading = document.styles[name]
+        heading.font.name = LATIN_FONT
+        heading.font.size = Pt(size)
+        heading.font.bold = True
+        heading.font.color.rgb = RGBColor(0, 0, 0)
+        heading.element.rPr.rFonts.set(qn("w:eastAsia"), HEAD_FONT)
+        heading.paragraph_format.space_before = Pt(10 if size >= 14 else 6)
+        heading.paragraph_format.space_after = Pt(4)
+        heading.paragraph_format.line_spacing = 1.5
+        heading.paragraph_format.keep_with_next = True
+    add_page_number_footer(document)
     return document
 
 
+def add_page_number_footer(document: Document) -> None:
+    """页脚居中页码（PAGE 域）。"""
+    for section in document.sections:
+        footer_paragraph = section.footer.paragraphs[0]
+        footer_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = footer_paragraph.add_run()
+        set_run_font(run, BODY_FONT, 9)
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+        instr = OxmlElement("w:instrText")
+        instr.set(qn("xml:space"), "preserve")
+        instr.text = " PAGE "
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        run._r.append(begin)
+        run._r.append(instr)
+        run._r.append(end)
+
+
 def add_heading(document: Document, text: str, level: int) -> None:
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_before = Pt(10 if level <= 2 else 6)
-    paragraph.paragraph_format.space_after = Pt(4)
+    paragraph = document.add_paragraph(style=f"Heading {level}")
     if level == 1:
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = paragraph.add_run(text)
@@ -116,7 +148,11 @@ def add_image(document: Document, path: Path, caption: str | None = None) -> Non
         return
     paragraph = document.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.add_run().add_picture(str(path), width=Cm(14.0))
+    inline = paragraph.add_run().add_picture(str(path), width=Cm(14.0))
+    # 图片替代文本，便于无障碍阅读与 Word“可选文字”检查
+    descr = caption or path.stem.replace("_", " ")
+    inline._inline.docPr.set("descr", descr)
+    inline._inline.docPr.set("title", descr)
     if caption:
         cap = document.add_paragraph()
         cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -129,6 +165,12 @@ def add_table(document: Document, rows: list[list[str]]) -> None:
     table = document.add_table(rows=1 + len(body), cols=len(header))
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    # 长表跨页时重复表头
+    header_row = table.rows[0]
+    tr_pr = header_row._tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    tr_pr.append(tbl_header)
     for index, text in enumerate(header):
         cell = table.rows[0].cells[index]
         cell.text = ""
@@ -159,15 +201,62 @@ def parse_table(lines: list[str]) -> list[list[str]]:
     return rows
 
 
-def convert() -> Path:
+def convert(source: Path = SOURCE, target: Path = TARGET,
+            stop_before: str | None = None, start_at: str | None = None) -> Path:
     document = setup_document()
-    lines = SOURCE.read_text(encoding="utf-8").splitlines()
+    lines = source.read_text(encoding="utf-8").splitlines()
+    if start_at is not None:
+        for position, candidate in enumerate(lines):
+            if candidate.strip() == start_at:
+                lines = lines[position:]
+                break
+    if stop_before is not None:
+        for position, candidate in enumerate(lines):
+            if candidate.strip() == stop_before:
+                lines = lines[:position]
+                break
     index = 0
     pending_image = None  # 独立的图片说明行
     while index < len(lines):
         raw = lines[index]
         line = raw.strip()
         if not line:
+            index += 1
+            continue
+        if line.startswith("<!--") and line.endswith("-->"):
+            # Markdown 注释：如表格展开标记，仅用于脚本定位，不写入 Word
+            index += 1
+            continue
+        if line.startswith("```"):
+            # 代码块：等宽字体、不首行缩进，逐行保留
+            index += 1
+            code_lines = []
+            while index < len(lines) and not lines[index].strip().startswith("```"):
+                code_lines.append(lines[index].rstrip())
+                index += 1
+            for code_line in code_lines:
+                paragraph = document.add_paragraph()
+                paragraph.paragraph_format.line_spacing = 1.0
+                paragraph.paragraph_format.left_indent = Pt(12)
+                run = paragraph.add_run(code_line if code_line else " ")
+                run.font.name = "Consolas"
+                run.font.size = Pt(9)
+            index += 1
+            continue
+        if line == "$$":
+            # 独立公式块：居中、斜体，公式内容按原文保留
+            index += 1
+            formula_lines = []
+            while index < len(lines) and lines[index].strip() != "$$":
+                formula_lines.append(lines[index].strip())
+                index += 1
+            paragraph = document.add_paragraph()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.line_spacing = 1.5
+            run = paragraph.add_run(" ".join(formula_lines))
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(11)
+            run.italic = True
             index += 1
             continue
         if line.startswith("# "):
@@ -202,11 +291,24 @@ def convert() -> Path:
         else:
             add_paragraph(document, line)
         index += 1
-    TARGET.parent.mkdir(parents=True, exist_ok=True)
-    document.save(str(TARGET))
-    print(f"已生成：{TARGET}")
-    return TARGET
+    target.parent.mkdir(parents=True, exist_ok=True)
+    document.save(str(target))
+    print(f"已生成：{target}")
+    return target
 
 
 if __name__ == "__main__":
-    convert()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Markdown 论文 → Word")
+    parser.add_argument("--source", type=Path, default=SOURCE)
+    parser.add_argument("--target", type=Path, default=TARGET)
+    parser.add_argument("--stop-before", default=None, help="遇到该行（strip 后完全相等）即停止")
+    parser.add_argument("--start-at", default=None, help="从该行（strip 后完全相等）开始")
+    args = parser.parse_args()
+    convert(
+        source=args.source,
+        target=args.target,
+        stop_before=args.stop_before,
+        start_at=args.start_at,
+    )

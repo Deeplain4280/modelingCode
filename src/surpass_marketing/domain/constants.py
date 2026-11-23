@@ -329,7 +329,7 @@ PREFERENCE_INDICATORS = {
         "brand_mass_share",
     ],
     "entertainment": [
-        "vid_l1_entertainment",
+        "media_ch_video",
         "tag_genre_reality",
         "tag_genre_comedy",
         "tag_genre_romance",

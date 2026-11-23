@@ -6,10 +6,13 @@
 1. 原始 xlsx 只读；所有中间结果写入 ``outputs/interim``（parquet）。
 2. 每张行为表先按用户聚合为“用户 × 特征”，再与主表左连接，保证一行一个用户。
 3. 特征命名遵循前缀约定（见 ``service_impl/feature_columns.py``）：
-   ``vol_*`` 活跃量级、``idx_*`` 行为指数、``track_*`` 跟踪时间、
-   ``brand_*/pref_*`` 电商偏好、``vid_*/genre_*`` 视频偏好、``media_*`` 触媒渠道、
-   ``tag_*`` 行为标签偏好、``has_*`` 数据覆盖标记。
-4. 缺失策略：计数/份额类缺失填 0（无行为即 0），由 ``has_*`` 标记区分“未观测”；
+   ``vol_*`` 活跃量级、``idx_*`` 行为指数、``brand_*/pref_*`` 电商偏好、
+   ``vid_*/genre_*`` 视频偏好、``media_*`` 触媒渠道、``tag_*`` 行为标签偏好、
+   ``has_*`` 数据覆盖标记。跟踪状态表派生的 ``track_*`` 一律不作为特征。
+4. **时间口径（防标签泄漏）**：购买者的电商/视频行为只取“首次购买之前”的记录；
+   未购买者取统一观察窗口截止（2015-11-30 23:59:59）；附件2 只取其待判时间之前的记录。
+   购买标签取“任一记录出现购买”（与论文口径一致）。
+5. 缺失策略：计数/份额类缺失填 0（无行为即 0），由 ``has_*`` 标记区分“未观测”；
    人口学与行为指数保留 NaN，交由模型管线中的中位数填补，避免把缺失编码成真实类别。
 """
 from __future__ import annotations
@@ -29,11 +32,14 @@ from ..domain.entities import DataAudit
 from ..repository.artifact_repository import ArtifactRepository
 from ..repository.excel_repository import ExcelRepository
 from ..service import DataService
-from ..utils.text_parse import add_time_features, match_keyword_groups, parse_behavior_tags
+from ..utils.text_parse import match_keyword_groups, parse_behavior_tags
 
-TARGET_DAY = pd.Timestamp("2015-11-30")
+# 观察窗口截止时间：目标用户表的记录时间范围为 2015-11-01 ~ 2015-11-30
+WINDOW_END = pd.Timestamp("2015-11-30 23:59:59")
 USER_FEATURE_CACHE = "user_features.parquet"
 FEATURE_TABLE_SUFFIX = ".parquet"
+FEATURE_CACHE_VERSION = "4"  # 口径变更（去 track_*、去视频特征、电商强度归一化）后递增
+CACHE_VERSION_FILE = "feature_cache_version.txt"
 
 # 各来源特征表名（缓存于 outputs/interim）
 FEAT_IDENTITY = "feat_identity"
@@ -98,24 +104,10 @@ class DataServiceImpl(DataService):
         return self.config.paths.interim_dir / f"{name}{FEATURE_TABLE_SUFFIX}"
 
     # ------------------------------------------------------------------ #
-    # 主表与跟踪时间特征
+    # 主表（标签口径 + 时间截断口径）
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _add_track_features(frame: pd.DataFrame, time_column: str, prefix: str = "track") -> pd.DataFrame:
-        out = frame.copy()
-        ts = pd.to_datetime(out[time_column], errors="coerce")
-        out[f"{prefix}_hour"] = ts.dt.hour.astype("float")
-        out[f"{prefix}_weekday"] = ts.dt.weekday.astype("float")
-        out[f"{prefix}_is_weekend"] = ((ts.dt.weekday >= 5) & ts.notna()).astype("float")
-        hour = ts.dt.hour
-        out[f"{prefix}_is_night"] = (((hour >= 20) | (hour < 2)) & ts.notna()).astype("float")
-        out[f"{prefix}_day"] = ts.dt.day.astype("float")
-        recency = (TARGET_DAY - ts.dt.normalize()).dt.days.astype("float")
-        out[f"{prefix}_recency_days"] = recency.clip(lower=0)
-        return out
-
     def _build_master(self) -> pd.DataFrame:
-        """主表：目标用户去重 + 购买标签 + 跟踪时间特征。"""
+        """主表：目标用户去重 + 购买标签 + 购买时间/观察截止时间（元信息，不进模型）。"""
         raw = self._sheet(C.SHEET_TARGET_USERS)
         raw = raw.drop(columns=[column for column in raw.columns if str(column).startswith("Unnamed")], errors="ignore")
         raw = self._numeric_user_ids(raw)
@@ -127,22 +119,47 @@ class DataServiceImpl(DataService):
             {
                 "target": grouped["_purchase"].max(),
                 "track_time": grouped["_time"].max(),
-                "track_row_count": grouped["_purchase"].size(),
                 "state_set": grouped[C.COL_STATE].apply(
                     lambda values: "|".join(sorted({str(value).strip() for value in values.dropna()}))
                 ),
             }
         ).reset_index()
         master["target"] = master["target"].astype("int8")
-        master["track_row_count"] = master["track_row_count"].astype("float")
-        master = self._add_track_features(master, "track_time")
+
+        # 购买时间：该用户首次出现“购买”记录的时间；仅用于截断其行为数据
+        first_purchase = raw.loc[raw["_purchase"] == 1].groupby(C.COL_USER_ID)["_time"].min()
+        master["purchase_time"] = master[C.COL_USER_ID].map(first_purchase)
+        master["cutoff_time"] = master["purchase_time"].where(
+            (master["target"] == 1) & master["purchase_time"].notna(), WINDOW_END
+        )
+
+        # 诊断字段：购买后仍出现浏览/搜索记录的用户（说明“末状态购买”口径会漏标签）
+        later = raw[[C.COL_USER_ID, "_time", C.COL_STATE]].merge(
+            master[[C.COL_USER_ID, "purchase_time"]], on=C.COL_USER_ID, how="left"
+        )
+        post = later.loc[
+            later["purchase_time"].notna()
+            & (later["_time"] > later["purchase_time"])
+            & later[C.COL_STATE].astype(str).str.strip().isin(["浏览", "搜索"])
+        ]
+        master["post_purchase_activity"] = master[C.COL_USER_ID].isin(set(post[C.COL_USER_ID])).astype("int8")
+
         self.logger.info(
-            "主表构建完成：%d 位目标用户，购买者 %d 人（阳性率 %.2f%%）",
+            "主表构建完成：%d 位目标用户，购买者 %d 人（阳性率 %.2f%%），购买后仍有浏览/搜索记录 %d 人",
             len(master),
             int(master["target"].sum()),
             100 * master["target"].mean(),
+            int(master["post_purchase_activity"].sum()),
         )
         return master
+
+    @staticmethod
+    def _cutoffs(master: pd.DataFrame) -> pd.Series:
+        """用户编号 → 行为截断时间（购买者=首次购买时间，未购者=统一窗口截止）。"""
+        return pd.Series(
+            pd.to_datetime(master["cutoff_time"]).to_numpy(),
+            index=master[C.COL_USER_ID].to_numpy(),
+        )
 
     # ------------------------------------------------------------------ #
     # 各来源用户级特征
@@ -216,7 +233,18 @@ class DataServiceImpl(DataService):
         self.logger.info("行为标签特征完成：%d 位用户，%d 列", *frame.shape)
         return frame
 
-    def _build_ecommerce_features(self) -> pd.DataFrame:
+    def _truncate_by_cutoff(self, work: pd.DataFrame, cutoffs: pd.Series) -> pd.DataFrame:
+        """只保留时间不晚于用户截断时间的记录（购买者=首次购买前，未购者=窗口截止）。"""
+        cut = pd.DataFrame(
+            {C.COL_USER_ID: cutoffs.index.to_numpy(), "_cutoff": cutoffs.to_numpy()}
+        )
+        merged = work.merge(cut, on=C.COL_USER_ID, how="left")
+        before = len(merged)
+        merged = merged.loc[merged["_ts"].notna() & (merged["_ts"] <= merged["_cutoff"])].copy()
+        self.logger.info("按用户时间截断：%d → %d 行（剔除 %d 行）", before, len(merged), before - len(merged))
+        return merged
+
+    def _ecommerce_frame(self, cutoffs: pd.Series) -> pd.DataFrame:
         raw = self._sheet(C.SHEET_ECOMMERCE, cache=False)
         raw = self._numeric_user_ids(raw)
         l1 = raw[C.COL_ECOM_L1].fillna("").astype(str)
@@ -246,14 +274,21 @@ class DataServiceImpl(DataService):
         work["_weekend"] = (work["_ts"].dt.weekday >= 5).astype("float")
         work["_hour"] = hour.astype("float")
         work["_date"] = work["_ts"].dt.normalize()
+        work = self._truncate_by_cutoff(work, cutoffs)
 
         grouped = work.groupby(C.COL_USER_ID)
+        size = grouped.size().astype("float")
+        active_days = grouped["_date"].nunique().astype("float").clip(lower=1.0)
+        models = grouped["_model"].apply(lambda s: s[s.str.len() > 0].nunique()).astype("float")
+        l2_count = grouped["_l2"].nunique().astype("float")
+        surpass_count = grouped["_surpass"].sum().astype("float")
         frame = pd.DataFrame(
             {
-                "vol_ecom_n": grouped.size().astype("float"),
-                "vol_ecom_days": grouped["_date"].nunique().astype("float"),
-                "vol_ecom_models": grouped["_model"].apply(lambda s: s[s.str.len() > 0].nunique()).astype("float"),
-                "vol_ecom_l2_n": grouped["_l2"].nunique().astype("float"),
+                # 观测窗口长度因购买时点而异，绝对频次会把“窗口长度”当成购买信号；
+                # 因此强度类特征统一用“每个活跃日的平均事件数”，构成类特征用份额。
+                "vol_ecom_rate": size / active_days,
+                "vol_ecom_models_rate": models / active_days,
+                "vol_ecom_l2_rate": l2_count / active_days,
                 "vol_ecom_night_share": grouped["_night"].mean(),
                 "vol_ecom_weekend_share": grouped["_weekend"].mean(),
                 "vol_ecom_hour_mean": grouped["_hour"].mean(),
@@ -263,7 +298,7 @@ class DataServiceImpl(DataService):
                 "pref_surpass_share": (
                     grouped["_surpass"].sum() / grouped["_has_model"].sum().replace(0, np.nan)
                 ).fillna(0.0),
-                "pref_surpass_count": np.log1p(grouped["_surpass"].sum().astype("float")),
+                "pref_surpass_rate": np.log1p(surpass_count / active_days),
                 "has_ecom": 1.0,
             }
         ).reset_index()
@@ -283,11 +318,16 @@ class DataServiceImpl(DataService):
         frame["brand_mass_share"] = frame[C.COL_USER_ID].map(
             brand_share[mass_columns].sum(axis=1) if mass_columns else pd.Series(dtype="float")
         ).fillna(0.0)
-        frame.to_parquet(self._feature_table_path(FEAT_ECOM), index=False)
-        self.logger.info("电商行为特征完成：%d 位用户，%d 列", *frame.shape)
         return frame
 
-    def _build_video_features(self) -> pd.DataFrame:
+    def _build_ecommerce_features(self) -> pd.DataFrame:
+        cutoffs = self._cutoffs(self._build_master())
+        frame = self._ecommerce_frame(cutoffs)
+        frame.to_parquet(self._feature_table_path(FEAT_ECOM), index=False)
+        self.logger.info("电商行为特征完成：%d 位用户，%d 列（已按用户时间截断）", *frame.shape)
+        return frame
+
+    def _video_frame(self, cutoffs: pd.Series) -> pd.DataFrame:
         raw = self._sheet(C.SHEET_VIDEO, cache=False)
         raw = self._numeric_user_ids(raw)
         l1 = raw[C.COL_VIDEO_L1].fillna("").astype(str)
@@ -317,6 +357,7 @@ class DataServiceImpl(DataService):
         work["_weekend"] = (work["_ts"].dt.weekday >= 5).astype("float")
         work["_hour"] = hour.astype("float")
         work["_date"] = work["_ts"].dt.normalize()
+        work = self._truncate_by_cutoff(work, cutoffs)
 
         grouped = work.groupby(C.COL_USER_ID)
         frame = pd.DataFrame(
@@ -340,8 +381,13 @@ class DataServiceImpl(DataService):
             work[column] = (work["_genre"] == group).astype("int8")
             frame[f"genre_{group}"] = grouped[column].mean()
         frame = frame.reset_index()
+        return frame
+
+    def _build_video_features(self) -> pd.DataFrame:
+        cutoffs = self._cutoffs(self._build_master())
+        frame = self._video_frame(cutoffs)
         frame.to_parquet(self._feature_table_path(FEAT_VIDEO), index=False)
-        self.logger.info("视频行为特征完成：%d 位用户，%d 列", *frame.shape)
+        self.logger.info("视频行为特征完成：%d 位用户，%d 列（已按用户时间截断）", *frame.shape)
         return frame
 
     def _build_media_features(self) -> pd.DataFrame:
@@ -395,7 +441,19 @@ class DataServiceImpl(DataService):
     # ------------------------------------------------------------------ #
     # 特征缓存与合并
     # ------------------------------------------------------------------ #
+    def _cache_version_path(self) -> Path:
+        return self.config.paths.interim_dir / CACHE_VERSION_FILE
+
+    def _cache_is_current(self) -> bool:
+        path = self._cache_version_path()
+        if not path.exists():
+            return False
+        return path.read_text(encoding="utf-8").strip() == FEATURE_CACHE_VERSION
+
     def ensure_feature_tables(self, force: bool = False) -> None:
+        version_current = self._cache_is_current()
+        if not version_current:
+            self.logger.info("特征缓存版本不一致或缺失（期望 %s），将强制重建", FEATURE_CACHE_VERSION)
         builders = {
             FEAT_IDENTITY: self._build_identity_features,
             FEAT_TAGS: self._build_tag_features,
@@ -405,10 +463,11 @@ class DataServiceImpl(DataService):
         }
         for name, builder in builders.items():
             path = self._feature_table_path(name)
-            if path.exists() and not force:
+            if path.exists() and not force and version_current:
                 continue
             self.logger.info("构建特征表：%s", name)
             builder()
+        self._cache_version_path().write_text(FEATURE_CACHE_VERSION, encoding="utf-8")
 
     def _load_feature_table(self, name: str) -> pd.DataFrame:
         return pd.read_parquet(self._feature_table_path(name))
@@ -443,16 +502,12 @@ class DataServiceImpl(DataService):
 
     def build_user_features(self, force: bool = False) -> pd.DataFrame:
         cache = self.config.paths.interim_dir / USER_FEATURE_CACHE
-        if cache.exists() and not force:
+        if cache.exists() and not force and self._cache_is_current():
             return pd.read_parquet(cache)
 
         self.ensure_feature_tables(force=force)
         master = self._build_master()
         frame = self._merge_feature_tables(master)
-        frame["vol_total"] = frame["vol_ecom_n"] + frame["vol_video_n"] + frame["vol_media_n"]
-        frame["vol_source_count"] = (
-            frame["has_ecom"] + frame["has_video"] + frame["has_media"] + frame["has_identity"] + frame["has_tags"]
-        )
         attachment2_ids = set(self._attachment2_raw()[C.COL_USER_ID].tolist())
         frame["is_attachment2"] = frame[C.COL_USER_ID].isin(attachment2_ids).astype("int8")
         frame.to_parquet(cache, index=False)
@@ -460,32 +515,31 @@ class DataServiceImpl(DataService):
         return frame
 
     def build_attachment2_features(self) -> pd.DataFrame:
+        """附件2 特征：与训练同口径（无 track_* 特征），行为按待判时间截断。"""
         self.ensure_feature_tables()
         raw = self._attachment2_raw()
         base = raw[[C.COL_USER_ID]].copy()
-        frame = self._merge_feature_tables(base)
-        frame["vol_total"] = frame["vol_ecom_n"] + frame["vol_video_n"] + frame["vol_media_n"]
-        frame["vol_source_count"] = (
-            frame["has_ecom"] + frame["has_video"] + frame["has_media"] + frame["has_identity"] + frame["has_tags"]
+        base["a2_cutoff_time"] = pd.to_datetime(raw[C.COL_A2_TIME], errors="coerce")
+        frame = base.copy()
+        # 静态画像：身份、行为标签、触媒（触媒表无时间戳，只能作静态渠道画像）
+        for name in (FEAT_IDENTITY, FEAT_TAGS, FEAT_MEDIA):
+            frame = frame.merge(self._load_feature_table(name), on=C.COL_USER_ID, how="left")
+        # 行为表：只取附件2 待判时间之前的记录，避免使用待判时点之后的信息
+        cutoffs = pd.Series(
+            base["a2_cutoff_time"].fillna(WINDOW_END).to_numpy(),
+            index=base[C.COL_USER_ID].to_numpy(),
         )
-        # 附件2 自带“最近一次停留时间”，用它覆盖主表时间，保证预测时点一致
-        time_frame = pd.DataFrame(
-            {
-                C.COL_USER_ID: raw[C.COL_USER_ID].to_numpy(),
-                "track_time": pd.to_datetime(raw[C.COL_A2_TIME], errors="coerce").to_numpy(),
-            }
-        )
-        frame = frame.drop(columns=[column for column in frame.columns if column.startswith("track_")], errors="ignore")
-        frame = frame.merge(time_frame, on=C.COL_USER_ID, how="left")
-        frame["track_row_count"] = 0.0
-        frame = self._add_track_features(frame, "track_time")
+        for table in (self._ecommerce_frame(cutoffs),):
+            frame = frame.merge(table, on=C.COL_USER_ID, how="left")
+        zero_columns = self._zero_fill_columns(frame)
+        frame[zero_columns] = frame[zero_columns].fillna(0.0)
         frame["is_attachment2"] = 1
 
         master = self._load_user_feature_labels()
         frame = frame.merge(master, on=C.COL_USER_ID, how="left")
         frame["in_target_table"] = frame["known_target"].notna().astype("int8")
         frame["known_target"] = frame["known_target"].fillna(-1).astype("int8")
-        self.logger.info("附件2 特征矩阵完成：%d 位用户 × %d 列", *frame.shape)
+        self.logger.info("附件2 特征矩阵完成：%d 位用户 × %d 列（行为按待判时间截断）", *frame.shape)
         return frame
 
     def _load_user_feature_labels(self) -> pd.DataFrame:
@@ -533,10 +587,51 @@ class DataServiceImpl(DataService):
         purchase_state = self._sheet(C.SHEET_TARGET_USERS)
         state_counts = purchase_state[C.COL_STATE].astype(str).str.strip().value_counts().to_dict()
         target_raw = self._numeric_user_ids(purchase_state)
-        positive = target_raw.assign(
-            target=(target_raw[C.COL_STATE].astype(str).str.strip() == C.PURCHASE_STATE).astype("int8")
-        ).groupby(C.COL_USER_ID)["target"].max()
+        target_raw["_state"] = target_raw[C.COL_STATE].astype(str).str.strip()
+        target_raw["_time"] = pd.to_datetime(target_raw[C.COL_TRACK_TIME], errors="coerce")
+        target_raw["_purchase"] = (target_raw["_state"] == C.PURCHASE_STATE).astype("int8")
+        positive = target_raw.groupby(C.COL_USER_ID)["_purchase"].max()
         positive_rate = float(positive.mean()) if len(positive) else 0.0
+
+        # 标签口径对照：末次记录状态 vs 任一记录购买（论文口径说明的依据）
+        ordered = target_raw.sort_values([C.COL_USER_ID, "_time"])
+        last_state = ordered.groupby(C.COL_USER_ID)["_state"].last()
+        last_purchase_users = int((last_state == C.PURCHASE_STATE).sum())
+        multi_state_users = int(target_raw.groupby(C.COL_USER_ID)["_state"].nunique().gt(1).sum())
+        first_purchase = (
+            target_raw.loc[target_raw["_purchase"] == 1].groupby(C.COL_USER_ID)["_time"].min()
+        )
+        post = target_raw.merge(first_purchase.rename("_first_purchase"), on=C.COL_USER_ID, how="left")
+        post_purchase_users = int(
+            post.loc[
+                post["_first_purchase"].notna()
+                & (post["_time"] > post["_first_purchase"])
+                & post["_state"].isin(["浏览", "搜索"]),
+                C.COL_USER_ID,
+            ].nunique()
+        )
+        label_caliber = pd.DataFrame(
+            [
+                {"口径": "原始记录数", "数值": int(len(target_raw)), "说明": "目标用户表行数（同一用户可多行）"},
+                {"口径": "去重用户数", "数值": int(target_raw[C.COL_USER_ID].nunique()), "说明": "按用户编号去重"},
+                {
+                    "口径": "任一记录购买（本文采用）",
+                    "数值": int(positive.sum()),
+                    "说明": "任一状态为购买即正例，避免漏掉购买后仍有浏览/搜索的用户",
+                },
+                {
+                    "口径": "末次记录状态为购买",
+                    "数值": last_purchase_users,
+                    "说明": "仅按最后一条记录判定，会漏标签",
+                },
+                {"口径": "多状态用户数", "数值": multi_state_users, "说明": "同一用户出现两种及以上状态"},
+                {
+                    "口径": "购买后仍有浏览/搜索",
+                    "数值": post_purchase_users,
+                    "说明": "购买后行为记录存在，末状态口径不完整",
+                },
+            ]
+        )
 
         attachment2 = self._attachment2_raw()
         decision_column = C.COL_A2_DECISION if C.COL_A2_DECISION in attachment2.columns else None
@@ -545,11 +640,14 @@ class DataServiceImpl(DataService):
         issues: List[str] = []
         issues.append(
             f"目标用户表存在同一用户多行（重复 {duplicate_rows.get(C.SHEET_TARGET_USERS, 0)} 行），"
-            "对应“浏览/搜索/购买”多状态记录，已按用户聚合（任一状态为购买即正例）。"
+            "对应“浏览/搜索/购买”多状态记录。购买标签统一取“任一记录出现购买”："
+            f"任一购买 {int(positive.sum())} 人，末次记录为购买仅 {last_purchase_users} 人，"
+            f"差 {int(positive.sum()) - last_purchase_users} 人来自购买后仍有浏览/搜索记录。"
         )
         issues.append(
             "“在某购物平台上的平均每次停留的时间    分:秒”列实际存储的是时间戳"
-            f"（{time_ranges.get(C.SHEET_TARGET_USERS, '未知')}），并非时长，本文按时间戳使用并据此派生活跃时段特征。"
+            f"（{time_ranges.get(C.SHEET_TARGET_USERS, '未知')}），并非时长；"
+            "本文仅将其用于确定观察截止时间与描述性统计，不作为模型特征。"
         )
         for sheet in (C.SHEET_IDENTITY, C.SHEET_BEHAVIOR_TAGS, C.SHEET_ECOMMERCE, C.SHEET_VIDEO, C.SHEET_MEDIA):
             issues.append(
@@ -561,8 +659,10 @@ class DataServiceImpl(DataService):
             "即待判用户没有真实标签，因此不能计算其预测精度，只能给出概率与分层。"
         )
         issues.append(
-            "电商/视频行为的时间范围超出 11 月（最晚至 12-07），存在观察窗口不一致；"
-            "由于目标用户的购买状态来自同一观察期，本文仅使用行为结构与活跃度特征，避免直接使用状态列造成标签泄漏。"
+            "电商/视频行为的时间范围超出 11 月（最晚至 12-07），存在观察窗口不一致。"
+            "本文按用户截断行为数据：购买者只取首次购买之前的记录，未购买者取统一窗口截止"
+            f"（{WINDOW_END:%Y-%m-%d %H:%M}），附件2 只取待判时间之前的记录；"
+            "触媒表无时间戳，只能作为静态渠道画像，不能做时点截断。"
         )
 
         audit = DataAudit(
@@ -577,6 +677,7 @@ class DataServiceImpl(DataService):
                 "positive_users": int(positive.sum()),
                 "positive_rate": positive_rate,
                 "state_counts": state_counts,
+                "label_caliber": label_caliber.to_dict(orient="records"),
                 "time_ranges": time_ranges,
                 "attachment2_users": int(len(attachment2)),
                 "attachment2_decision_filled": decision_filled,
@@ -598,6 +699,9 @@ class DataServiceImpl(DataService):
             if sheet in audit.extra.get("time_ranges", {}):
                 report.at[index, "说明"] = f"时间范围：{audit.extra['time_ranges'][sheet]}"
         self.artifacts.save_table(report, "data_quality_report.csv")
+        caliber = audit.extra.get("label_caliber") or []
+        if caliber:
+            self.artifacts.save_table(pd.DataFrame(caliber), "表1-1B_购买标签口径.csv")
         issue_text = "\n".join(f"{i + 1}. {issue}" for i, issue in enumerate(audit.quality_issues))
         self.artifacts.save_text(
             "数据质量问题清单\n" + "=" * 30 + "\n" + issue_text + "\n",

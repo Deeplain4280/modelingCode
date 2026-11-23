@@ -67,14 +67,14 @@ def test_rank_unpurchased_topn_filters_and_tie_break(service):
     )
     bundle = DummyBundle({5: 0.4, 3: 0.4, 9: 0.9, 1: 0.1, 7: 0.99})
     ranked = service.rank_unpurchased_topn(bundle, users, top_n=10)
-    # 已购买(9)与附件2用户(7)被剔除
+    # 仅剔除已购买用户(9)；附件1 中未购的附件2 重叠用户(7)允许进入榜单
     assert 9 not in ranked["用户编号"].tolist()
-    assert 7 not in ranked["用户编号"].tolist()
-    assert len(ranked) == 3
+    assert 7 in ranked["用户编号"].tolist()
+    assert len(ranked) == 4
     # 同分时用户编号升序
     tied = ranked.loc[ranked["潜力评分"] == 40.0, "用户编号"].tolist()
     assert tied == [3, 5]
-    assert ranked["排名"].tolist() == [1, 2, 3]
+    assert ranked["排名"].tolist() == [1, 2, 3, 4]
 
 
 def test_rank_unpurchased_respects_top_n(service):

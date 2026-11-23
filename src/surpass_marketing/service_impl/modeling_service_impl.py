@@ -32,7 +32,7 @@ from ..domain import constants as C
 from ..domain.entities import ModelBundle, ModelMetrics
 from ..repository.artifact_repository import ArtifactRepository
 from ..service import ModelingService
-from .feature_columns import select_features
+from .feature_columns import assert_feature_safety, select_features
 
 MODEL_LOGISTIC = "logistic"
 MODEL_RF = "random_forest"
@@ -94,6 +94,7 @@ class ModelingServiceImpl(ModelingService):
     def build_matrix(
         self, users: pd.DataFrame, feature_columns: Sequence[str]
     ) -> Tuple[pd.DataFrame, pd.Series]:
+        assert_feature_safety(feature_columns)
         missing = [column for column in feature_columns if column not in users.columns]
         if missing:
             raise KeyError(f"特征列不存在：{missing[:10]}")
@@ -372,30 +373,39 @@ class ModelingServiceImpl(ModelingService):
         y_train, y_test = label.iloc[train_index], label.iloc[test_index]
 
         base_pipeline = suite.bundle.pipeline
-        cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.seed)
-        oof = cross_val_predict(base_pipeline, x_train, y_train, cv=cv, method="predict_proba")[:, 1]
-        threshold = self.best_f1_threshold(y_train, oof)
-        self.logger.info("Q4 训练集 OOF 最大 F1 阈值：%.4f", threshold)
-
         method = str(self.calibration_cfg.get("method", "sigmoid"))
         calib_cv = int(self.calibration_cfg.get("cv", 5))
-        calibrated = CalibratedClassifierCV(base_pipeline, method=method, cv=calib_cv).fit(x_train, y_train)
-        prob_cal = calibrated.predict_proba(x_test)[:, 1]
-        # 校准后概率量纲已变化，阈值需在同一量纲上重新确定
-        calibrated_train_scores = calibrated.predict_proba(x_train)[:, 1]
-        calibrated_threshold = self.best_f1_threshold(y_train, calibrated_train_scores)
-        calibrated_metrics = self._metrics(
-            "校准后模型", y_test, prob_cal, threshold=calibrated_threshold
-        )
+
+        # 训练集“校准后 OOF”：外层 5 折，每折内用其余 4 折拟合“预处理+基学习器+校准器”，
+        # 避免用校准器在训练集上的拟合概率确定阈值（偏乐观）。
+        outer_cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.seed)
+        inner_cv = max(2, min(3, calib_cv))
+        calibrated_oof = cross_val_predict(
+            CalibratedClassifierCV(base_pipeline, method=method, cv=inner_cv),
+            x_train,
+            y_train,
+            cv=outer_cv,
+            method="predict_proba",
+        )[:, 1]
+        threshold = self.best_f1_threshold(y_train, calibrated_oof)
+        self.logger.info("Q4 训练集校准后 OOF 最大 F1 阈值：%.4f", threshold)
+
+        # 测试集只做一次最终评估：用全部训练集拟合校准模型后预测测试集
+        calibrated_pipeline = CalibratedClassifierCV(
+            base_pipeline, method=method, cv=calib_cv
+        ).fit(x_train, y_train)
+        prob_cal = calibrated_pipeline.predict_proba(x_test)[:, 1]
+        calibrated_metrics = self._metrics("校准后模型", y_test, prob_cal, threshold=threshold)
+        calibrated_metrics.extra["阈值来源"] = "训练集校准后OOF最大F1"
+        calibrated_metrics.extra["校准后OOF_F1阈值"] = threshold
         uncalibrated_metrics = suite.bundle.metrics
 
-        # 分层阈值：训练集全体用户分数的 0.90 / 0.70 分位（预测前固定）
-        train_scores = calibrated.predict_proba(x_train)[:, 1]
+        # 分层阈值同样由训练集校准后 OOF 概率的分位数固定，预测前不再改动
         thresholds = {
-            "high": float(np.quantile(train_scores, self.config.business.tier_high_quantile)),
-            "medium": float(np.quantile(train_scores, self.config.business.tier_medium_quantile)),
+            "high": float(np.quantile(calibrated_oof, self.config.business.tier_high_quantile)),
+            "medium": float(np.quantile(calibrated_oof, self.config.business.tier_medium_quantile)),
             "break_even": float(self.config.business.break_even_probability),
-            "f1": float(calibrated_threshold),
+            "f1": float(threshold),
         }
 
         # 全量重训（供附件2 与 Top100 打分）
@@ -412,14 +422,14 @@ class ModelingServiceImpl(ModelingService):
             calibration_method=method,
             notes=(
                 f"Q4 校准模型；入选基础模型 {suite.bundle.model_name}；"
-                f"未校准 OOF F1 阈值 {threshold:.4f}；校准后 F1 阈值 {calibrated_threshold:.4f}；sigmoid 校准（cv={calib_cv}）"
+                f"阈值来自训练集校准后OOF（F1={threshold:.4f}）；sigmoid 校准（cv={calib_cv}）"
             ),
         )
         coefficients = self._linear_coefficients(final_pipeline, features)
         importance = suite.feature_importance
         bundle.feature_importance = {str(name): float(value) for name, value in importance.items()}
         self.logger.info(
-            "Q4 校准后：Brier=%.4f PR-AUC=%.4f ROC-AUC=%.4f（阈值 %.4f）",
+            "Q4 校准后：Brier=%.4f PR-AUC=%.4f ROC-AUC=%.4f（OOF阈值 %.4f）",
             calibrated_metrics.brier,
             calibrated_metrics.pr_auc,
             calibrated_metrics.roc_auc,
@@ -436,12 +446,14 @@ class ModelingServiceImpl(ModelingService):
             feature_importance=importance,
             extra={
                 "threshold": threshold,
-                "calibrated_threshold": calibrated_threshold,
+                "calibrated_threshold": threshold,
                 "calibrated_metrics": calibrated_metrics,
                 "uncalibrated_metrics": uncalibrated_metrics,
+                "calibrated_oof": calibrated_oof,
+                "oof_threshold": threshold,
                 "all_scores": all_scores,
                 "scored_users": data[C.COL_USER_ID].to_numpy(),
-                "oof_scores": oof,
+                "oof_scores": calibrated_oof,
             },
         )
 

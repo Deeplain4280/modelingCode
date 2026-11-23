@@ -7,6 +7,7 @@ import pytest
 
 from surpass_marketing.service_impl.feature_columns import (
     META_COLUMNS,
+    assert_feature_safety,
     select_features,
 )
 
@@ -24,7 +25,7 @@ def frame() -> pd.DataFrame:
             "occ_0": [1, 0],
             "idx_shopping": [10.0, 55.0],
             "track_hour": [10, 20],
-            "vol_ecom_n": [3, 12],
+            "vol_ecom_rate": [3.0, 12.0],
             "has_identity": [1, 1],
             "brand_apple_share": [0.2, 0.6],
             "pref_phone_share": [0.5, 0.9],
@@ -39,7 +40,7 @@ def frame() -> pd.DataFrame:
 def test_select_q2_excludes_preference(frame):
     columns = select_features(frame, "q2")
     assert "age" in columns and "idx_shopping" in columns
-    assert "vol_ecom_n" in columns and "has_identity" in columns
+    assert "vol_ecom_rate" in columns and "has_identity" in columns
     assert not any(column.startswith("brand_") for column in columns)
 
 
@@ -61,6 +62,35 @@ def test_meta_columns_never_selected(frame):
     for group in ("q2", "q3", "q4"):
         for meta in META_COLUMNS:
             assert meta not in select_features(frame, group)
+
+
+def test_track_features_never_selected(frame):
+    frame = frame.assign(
+        track_hour=[10, 20],
+        track_row_count=[1, 2],
+        purchase_time=[pd.NaT, pd.Timestamp("2015-11-03 20:00")],
+    )
+    for group in ("q2", "q3", "q4"):
+        columns = select_features(frame, group)
+        assert not any(str(column).startswith("track_") for column in columns)
+
+
+def test_video_features_never_selected(frame):
+    frame = frame.assign(vol_video_n=[5.0, 8.0])
+    for group in ("q2", "q3", "q4"):
+        columns = select_features(frame, group)
+        assert not any(str(column).startswith("vid_") for column in columns)
+        assert not any(str(column).startswith("genre_") for column in columns)
+        assert "has_video" not in columns
+        assert "vol_video_n" not in columns
+
+
+def test_forbidden_feature_raises():
+    with pytest.raises(ValueError):
+        assert_feature_safety(["age", "track_row_count"])
+    with pytest.raises(ValueError):
+        assert_feature_safety(["age", "target"])
+    assert_feature_safety(["age", "vol_ecom_rate"]) is None
 
 
 def test_unknown_group_raises(frame):

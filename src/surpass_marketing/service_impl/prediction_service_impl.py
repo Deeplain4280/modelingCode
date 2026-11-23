@@ -208,10 +208,8 @@ class PredictionServiceImpl(PredictionService):
         self, bundle: ModelBundle, users: pd.DataFrame, top_n: Optional[int] = None
     ) -> pd.DataFrame:
         top_n = int(top_n or self.top_n)
-        candidates = users
-        if "is_attachment2" in candidates.columns:
-            candidates = candidates.loc[candidates["is_attachment2"] == 0]
-        candidates = candidates.loc[candidates["target"] == 0]
+        # 候选集=附件1 中全部未购目标用户（附件2 与附件1 重叠的 30 人如未购也可进入榜单）
+        candidates = users.loc[users["target"] == 0]
         scored = self.score_users(bundle, candidates)
         scored = scored.sort_values(["潜力评分", C.COL_USER_ID], ascending=[False, True]).head(top_n)
         scored.insert(0, "排名", np.arange(1, len(scored) + 1))
